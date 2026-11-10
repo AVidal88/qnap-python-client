@@ -14,6 +14,7 @@ from .exceptions import (
     QnapAPIError,
     QnapAuthError,
     QnapConnectionError,
+    QnapPermissionError,
     QnapTimeoutError,
 )
 from .models import (
@@ -75,15 +76,30 @@ class QnapClient:
     # ------------------------------------------------------------------
 
     async def __aenter__(self) -> "QnapClient":
-        await self._ensure_session()
-        await self.login()
+        try:
+            await self.login()
+        except BaseException:
+            await self.close()
+            raise
         return self
 
     async def __aexit__(self, *args: Any) -> None:
-        await self.logout()
-        if self._provided_session is None and self._session is not None:
-            await self._session.close()
-            self._session = None
+        await self.close()
+
+    async def close(self, *, logout: bool = True) -> None:
+        """Close an owned session, optionally without network I/O.
+
+        A supplied HTTP session is never closed. Set logout=False when the NAS
+        is unavailable or the integration is unloading; the local SID is cleared.
+        """
+        try:
+            if logout:
+                await self.logout()
+        finally:
+            self._sid = None
+            if self._provided_session is None and self._session is not None:
+                await self._session.close()
+                self._session = None
 
     # ------------------------------------------------------------------
     # Session / auth
@@ -108,29 +124,25 @@ class QnapClient:
 
     async def login(self) -> None:
         """Authenticate and store the session ID (authSid)."""
-        session = await self._ensure_session()
+        self._sid = None
         pwd_b64 = base64.b64encode(self._password.encode()).decode()
-        url = f"{self._base}/cgi-bin/authLogin.cgi"
-        data = {"user": self._username, "pwd": pwd_b64}
-        try:
-            async with session.post(url, data=data) as resp:
-                text = await resp.text()
-        except aiohttp.ClientConnectorError as exc:
-            raise QnapConnectionError(f"Cannot connect to {self._base}: {exc}") from exc
-        except asyncio.TimeoutError as exc:
-            raise QnapTimeoutError(f"Login timed out for {self._base}") from exc
+        text = await self._request(
+            "POST",
+            f"{self._base}/cgi-bin/authLogin.cgi",
+            data={"user": self._username, "pwd": pwd_b64},
+        )
 
-        parsed = self._parse_xml(text)
-        auth_passed = parsed.get("QDocRoot", {}).get("authPassed", "0")
+        root = self._root(text)
+        auth_passed = root.get("authPassed", "0")
         if str(auth_passed) != "1":
             raise QnapAuthError("Login failed — check username and password")
 
-        sid = parsed.get("QDocRoot", {}).get("authSid")
-        if not sid:
+        sid = root.get("authSid")
+        if not isinstance(sid, str) or not sid:
             raise QnapAuthError("Login succeeded but no authSid in response")
 
         self._sid = sid
-        _LOGGER.debug("Logged in; sid=%s", self._sid)
+        _LOGGER.debug("Logged in to QNAP")
 
     async def logout(self) -> None:
         """Invalidate the current session."""
@@ -154,28 +166,82 @@ class QnapClient:
         all_params = dict(params or {})
         all_params["sid"] = self._sid
 
-        url = f"{self._base}{path}"
+        return await self._request("GET", f"{self._base}{path}", params=all_params)
+
+    def _check_status(
+        self,
+        status: int,
+        expected: tuple[int, ...] | None,
+        *,
+        invalidate_session: bool,
+    ) -> None:
+        """Raise safe exceptions without response URLs, headers, or bodies."""
+        if status == 401:
+            if invalidate_session:
+                self._sid = None
+            raise QnapAuthError("Authentication rejected (HTTP 401)")
+        if status == 403:
+            raise QnapPermissionError("Permission denied (HTTP 403)")
+        if not 200 <= status < 300 or (expected is not None and status not in expected):
+            raise QnapAPIError(f"QNAP request failed (HTTP {status})")
+
+    async def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        expected: tuple[int, ...] | None = None,
+        invalidate_session: bool = True,
+        **kwargs: Any,
+    ) -> str:
+        """Send one request, without retries or credential-bearing redirects."""
+        session = await self._ensure_session()
+        if session.closed:
+            raise QnapConnectionError("HTTP session is closed")
         try:
-            async with self._active_session.get(url, params=all_params) as resp:
-                if resp.status == 401:
-                    self._sid = None
-                    raise QnapAuthError("Session expired (HTTP 401)")
-                resp.raise_for_status()
+            async with session.request(
+                method,
+                url,
+                timeout=self._timeout,
+                ssl=self._verify_ssl,
+                allow_redirects=False,
+                **kwargs,
+            ) as resp:
+                self._check_status(
+                    resp.status, expected, invalidate_session=invalidate_session
+                )
                 return await resp.text()
-        except aiohttp.ClientConnectorError as exc:
-            raise QnapConnectionError(f"Connection error: {exc}") from exc
-        except asyncio.TimeoutError as exc:
-            raise QnapTimeoutError("Request timed out") from exc
+        except aiohttp.ClientResponseError as exc:
+            # A supplied session may enable raise_for_status itself.
+            # Suppress its context, which can contain URLs and auth headers.
+            try:
+                self._check_status(
+                    exc.status, expected, invalidate_session=invalidate_session
+                )
+            except (QnapAuthError, QnapPermissionError, QnapAPIError) as error:
+                raise error from None
+            raise QnapAPIError("Invalid HTTP response") from None
+        except asyncio.TimeoutError:
+            raise QnapTimeoutError("QNAP request timed out") from None
+        except aiohttp.ClientError:
+            raise QnapConnectionError(
+                "QNAP connection failed or was interrupted"
+            ) from None
+        except UnicodeError:
+            raise QnapAPIError("QNAP response could not be decoded") from None
 
     @staticmethod
     def _parse_xml(text: str) -> dict[str, Any]:
         try:
             return xmltodict.parse(text)  # type: ignore[no-any-return]
-        except Exception as exc:
-            raise QnapAPIError(f"Failed to parse XML response: {exc}") from exc
+        except Exception:
+            raise QnapAPIError("Failed to parse XML response") from None
 
     def _root(self, text: str) -> dict[str, Any]:
-        return self._parse_xml(text).get("QDocRoot", {})
+        root = self._parse_xml(text).get("QDocRoot")
+        if not isinstance(root, dict):
+            raise QnapAPIError("Response has no QDocRoot object")
+        return root
 
     # ------------------------------------------------------------------
     # Public API
@@ -240,7 +306,9 @@ class QnapClient:
         root = self._root(text)
         inner = root.get("func", {}).get("ownContent", {}).get("root", root)
 
-        cpu_usage_str = inner.get("cpu_usage", root.get("cpu", {}).get("cpu_usage", "0"))
+        cpu_usage_str = inner.get(
+            "cpu_usage", root.get("cpu", {}).get("cpu_usage", "0")
+        )
         try:
             cpu_usage = float(str(cpu_usage_str).rstrip("%"))
         except (ValueError, TypeError):
@@ -330,7 +398,7 @@ class QnapClient:
                     "err_packets": err_packets,
                 }
             except (ValueError, TypeError) as exc:
-                _LOGGER.debug("Skipping NIC meta for %s: %s", iface_name, exc)
+                _LOGGER.debug("Skipping invalid NIC metadata: %s", type(exc).__name__)
 
         # Merge bandwidth + metadata
         results: list[NetworkInterface] = []
@@ -359,7 +427,7 @@ class QnapClient:
                     )
                     seen.add(key)
                 except (ValueError, TypeError) as exc:
-                    _LOGGER.debug("Skipping interface %s: %s", key, exc)
+                    _LOGGER.debug("Skipping invalid interface: %s", type(exc).__name__)
 
         # Add any NICs from sysinfo that weren't in bandwidth data
         for iface_name, meta in nic_meta.items():
@@ -389,7 +457,12 @@ class QnapClient:
             {"subfunc": "sysinfo", "hd_smart": "1"},
         )
         root = self._root(text)
-        drives_raw = root.get("func", {}).get("ownContent", {}).get("hdList", {}).get("hdInfo", [])
+        drives_raw = (
+            root.get("func", {})
+            .get("ownContent", {})
+            .get("hdList", {})
+            .get("hdInfo", [])
+        )
 
         if isinstance(drives_raw, dict):
             drives_raw = [drives_raw]
@@ -494,7 +567,7 @@ class QnapClient:
                 rpm = int(val.get("speed_rpm", val.get("rpm", 0)))
                 results.append(FanStatus(fan_number=i + 1, speed_rpm=rpm))
             except (ValueError, TypeError) as exc:
-                _LOGGER.debug("Skipping fan entry %d: %s", i, exc)
+                _LOGGER.debug("Skipping fan entry %d: %s", i, type(exc).__name__)
 
         return results
 
@@ -558,14 +631,19 @@ class QnapClient:
             return_exceptions=True,
         )
 
+        # Core system information is required to distinguish unavailable NASes
+        # from successfully polled devices with unsupported optional sections.
+        if isinstance(system_info, Exception):
+            raise system_info
+
         def _unwrap(result: Any, default: Any) -> Any:
             if isinstance(result, Exception):
-                _LOGGER.warning("get_all partial failure: %s", result)
+                _LOGGER.warning("get_all partial failure: %s", type(result).__name__)
                 return default
             return result
 
         return NasData(
-            system_info=_unwrap(system_info, SystemInfo("", "", "", "", 0)),
+            system_info=system_info,
             system_health=_unwrap(system_health, SystemHealth("Unknown")),
             cpu=_unwrap(cpu, CpuStats(usage_percent=0.0)),
             memory=_unwrap(memory, MemoryStats(0, 0, 0)),

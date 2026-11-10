@@ -61,6 +61,7 @@ QnapClient(
 |---|---|---|
 | `login()` | `None` | Authenticate and store session ID |
 | `logout()` | `None` | Log out and clear session |
+| `close()` | `None` | Log out and close an owned HTTP session; leave a supplied session open |
 | `get_system_info()` | `SystemInfo` | CPU, memory, firmware version, uptime |
 | `get_system_health()` | `SystemHealth` | Overall health status string |
 | `get_network_interfaces()` | `list[NetworkInterface]` | Per-interface RX/TX rates |
@@ -110,10 +111,49 @@ async with QnapClient(...) as client:
 | Exception | When |
 |---|---|
 | `QnapError` | Base exception |
-| `QnapAuthError` | Bad credentials or session expired |
+| `QnapAuthError` | Bad credentials or session expired (HTTP 401) |
+| `QnapPermissionError` | Request forbidden (HTTP 403) |
 | `QnapConnectionError` | NAS unreachable |
 | `QnapTimeoutError` | Request timed out |
 | `QnapAPIError` | Unexpected or malformed API response |
+
+## Transport and availability (unreleased 1.1.1)
+
+Requests are sent once, with the configured timeout and SSL verification, including
+when a caller supplies an HTTP session. Redirects are rejected to avoid forwarding
+credentials. QTS HTTP 401 raises `QnapAuthError` and clears the SID. Container Station HTTP 401
+raises the same error but preserves the QTS SID because its access checks can
+differ from monitoring access. HTTP 403 raises
+`QnapPermissionError`; other unsuccessful statuses raise `QnapAPIError`. Exception
+messages and library logs exclude session IDs, credentials, response bodies, and
+request URLs. XML authorization fields outside login are not interpreted as an
+expired session because their meaning can depend on the endpoint and permissions.
+
+`get_all()` requires a successful system-information request. Its failures propagate
+so consumers can mark the NAS unavailable; optional sections still use defaults on
+failure. These defaults do not prove that a firmware feature is unsupported.
+Use the async context manager or call the idempotent `close()` method. Closing logs
+out the current QTS session, but never closes a caller-supplied HTTP session.
+Use `close(logout=False)` during offline unload to clear the local SID and close an
+owned session without making a network request.
+
+NAS shutdown and reboot are not implemented. No request/response contract has been
+validated sufficiently for QTS 5.2 or QuTS hero. A disconnected request cannot prove
+that a power operation succeeded. The regression fixtures are synthetic and do not
+establish firmware compatibility. See the [QuTS hero report](https://github.com/disforw/python-qnap/issues/1)
+for known parser limitations in existing monitoring functions.
+
+Version 1.1.1 in this working branch is unreleased. Publish the library before a
+Home Assistant integration pins `qnap-client==1.1.1`; local editable installs are
+for development only.
+
+Run `pip install -e ".[dev]"` and `pytest tests/ -v` for the synthetic regressions.
+The dev extra temporarily limits aiohttp to `<3.14` because
+[aioresponses 0.7.9 cannot construct responses for aiohttp 3.14](https://github.com/pnuckowski/aioresponses/issues/289).
+This is a mock-tool limitation; the runtime dependency is not capped by this change.
+In a separate environment, install `pip install -e . pytest pytest-asyncio` and run
+`pytest tests/test_http.py -v` to check the transport with current aiohttp using a
+local synthetic HTTP server, without aioresponses or a physical NAS.
 
 ## HTTPS / Self-Signed Certificates
 

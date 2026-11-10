@@ -2,6 +2,26 @@
 
 All notable changes to `qnap-client` will be documented here.
 
+## [1.1.1] - Unreleased
+
+### Fixed
+- Remove session IDs, response bodies, request URLs, and raw transport errors from
+  library logs and exceptions. Disable credential-bearing redirects.
+- Preserve the QTS session when Container Station rejects access with HTTP 401.
+- Normalize HTTP authentication, permission, API, timeout, and connection failures;
+  add the exported `QnapPermissionError` for HTTP 403.
+- Add idempotent `close()`, preserve caller-owned sessions, and close owned sessions
+  after context-entry failures. Failed login discards any previous session ID.
+- Require successful system information in `get_all()` so an offline NAS is not
+  returned as empty successful telemetry; retain optional-section fallbacks.
+- Apply timeout and SSL verification when using caller-supplied sessions.
+- Align the runtime version with package metadata.
+
+### Validation limits
+- Transport tests use synthetic responses, not captured firmware fixtures.
+- NAS shutdown/reboot and QTS 5.2/QuTS hero power API compatibility remain unverified
+  and are not implemented. This version must be published before consumers pin it.
+
 ## [1.0.3] - 2026-05-05
 
 ### Fixed

@@ -11,6 +11,10 @@ class QnapAuthError(QnapError):
     """Authentication failed — bad credentials or session expired."""
 
 
+class QnapPermissionError(QnapError):
+    """The authenticated account lacks permission for the request."""
+
+
 class QnapConnectionError(QnapError):
     """Could not connect to the NAS."""
 

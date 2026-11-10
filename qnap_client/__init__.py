@@ -9,6 +9,7 @@ from .exceptions import (
     QnapAuthError,
     QnapConnectionError,
     QnapError,
+    QnapPermissionError,
     QnapTimeoutError,
 )
 from .models import (
@@ -26,13 +27,14 @@ from .models import (
     VolumeStats,
 )
 
-__version__ = "1.0.3"
+__version__ = "1.1.1"
 
 __all__ = [
     "QnapClient",
     "ContainerStationClient",
     # Exceptions
     "QnapError",
+    "QnapPermissionError",
     "QnapAuthError",
     "QnapConnectionError",
     "QnapTimeoutError",
