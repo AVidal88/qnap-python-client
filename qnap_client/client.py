@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
-from typing import Any
+from typing import Any, Literal, Self
+from xml.etree import ElementTree
 
 import aiohttp
 import xmltodict
@@ -14,6 +15,9 @@ from .exceptions import (
     QnapAPIError,
     QnapAuthError,
     QnapConnectionError,
+    QnapPermissionError,
+    QnapPowerBlockedError,
+    QnapPowerOutcomeUnknown,
     QnapTimeoutError,
 )
 from .models import (
@@ -31,6 +35,7 @@ from .models import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+_POWER_BLOCKERS = frozenset({"Rsync", "VMs", "RTRR", "ssd_cache_upgrading"})
 
 
 class QnapClient:
@@ -69,21 +74,37 @@ class QnapClient:
         self._base = f"{self._scheme}://{host}:{port}"
         self._session: aiohttp.ClientSession | None = None
         self._sid: str | None = None
+        self._power_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Context manager
     # ------------------------------------------------------------------
 
-    async def __aenter__(self) -> "QnapClient":
-        await self._ensure_session()
-        await self.login()
+    async def __aenter__(self) -> Self:
+        try:
+            await self.login()
+        except BaseException:
+            await self.close(logout=False)
+            raise
         return self
 
-    async def __aexit__(self, *args: Any) -> None:
-        await self.logout()
-        if self._provided_session is None and self._session is not None:
-            await self._session.close()
-            self._session = None
+    async def __aexit__(self, *args: object) -> None:
+        await self.close()
+
+    async def close(self, *, logout: bool = True) -> None:
+        """Close an owned session, optionally without network I/O.
+
+        A supplied HTTP session is never closed. Use ``logout=False`` if the
+        NAS may be offline, so closing the client sends no additional request.
+        """
+        try:
+            if logout:
+                await self.logout()
+        finally:
+            self._sid = None
+            if self._provided_session is None and self._session is not None:
+                await self._session.close()
+                self._session = None
 
     # ------------------------------------------------------------------
     # Session / auth
@@ -108,29 +129,25 @@ class QnapClient:
 
     async def login(self) -> None:
         """Authenticate and store the session ID (authSid)."""
-        session = await self._ensure_session()
+        self._sid = None
         pwd_b64 = base64.b64encode(self._password.encode()).decode()
-        url = f"{self._base}/cgi-bin/authLogin.cgi"
-        data = {"user": self._username, "pwd": pwd_b64}
-        try:
-            async with session.post(url, data=data) as resp:
-                text = await resp.text()
-        except aiohttp.ClientConnectorError as exc:
-            raise QnapConnectionError(f"Cannot connect to {self._base}: {exc}") from exc
-        except asyncio.TimeoutError as exc:
-            raise QnapTimeoutError(f"Login timed out for {self._base}") from exc
+        text = await self._request(
+            "POST",
+            f"{self._base}/cgi-bin/authLogin.cgi",
+            data={"user": self._username, "pwd": pwd_b64},
+        )
 
-        parsed = self._parse_xml(text)
-        auth_passed = parsed.get("QDocRoot", {}).get("authPassed", "0")
+        root = self._root(text)
+        auth_passed = root.get("authPassed", "0")
         if str(auth_passed) != "1":
             raise QnapAuthError("Login failed — check username and password")
 
-        sid = parsed.get("QDocRoot", {}).get("authSid")
-        if not sid:
+        sid = root.get("authSid")
+        if not isinstance(sid, str) or not sid:
             raise QnapAuthError("Login succeeded but no authSid in response")
 
         self._sid = sid
-        _LOGGER.debug("Logged in; sid=%s", self._sid)
+        _LOGGER.debug("Logged in to QNAP")
 
     async def logout(self) -> None:
         """Invalidate the current session."""
@@ -138,7 +155,7 @@ class QnapClient:
             return
         try:
             await self._get("/cgi-bin/authLogin.cgi", params={"logout": "1"})
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001, S110
             pass
         finally:
             self._sid = None
@@ -154,28 +171,187 @@ class QnapClient:
         all_params = dict(params or {})
         all_params["sid"] = self._sid
 
-        url = f"{self._base}{path}"
+        return await self._request("GET", f"{self._base}{path}", params=all_params)
+
+    def _check_status(
+        self,
+        status: int,
+        expected: tuple[int, ...] | None,
+        *,
+        invalidate_session: bool,
+    ) -> None:
+        """Raise safe exceptions without response URLs, headers, or bodies."""
+        if status == 401:
+            if invalidate_session:
+                self._sid = None
+            raise QnapAuthError("Authentication rejected (HTTP 401)")
+        if status == 403:
+            raise QnapPermissionError("Permission denied (HTTP 403)")
+        if not 200 <= status < 300 or (expected is not None and status not in expected):
+            raise QnapAPIError(f"QNAP request failed (HTTP {status})")
+
+    async def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        expected: tuple[int, ...] | None = None,
+        invalidate_session: bool = True,
+        **kwargs: Any,
+    ) -> str:
+        """Send one request, without retries or credential-bearing redirects."""
+        session = await self._ensure_session()
+        if session.closed:
+            raise QnapConnectionError("HTTP session is closed")
         try:
-            async with self._active_session.get(url, params=all_params) as resp:
-                if resp.status == 401:
-                    self._sid = None
-                    raise QnapAuthError("Session expired (HTTP 401)")
-                resp.raise_for_status()
+            async with session.request(
+                method,
+                url,
+                timeout=self._timeout,
+                ssl=self._verify_ssl,
+                allow_redirects=False,
+                **kwargs,
+            ) as resp:
+                self._check_status(
+                    resp.status, expected, invalidate_session=invalidate_session
+                )
                 return await resp.text()
-        except aiohttp.ClientConnectorError as exc:
-            raise QnapConnectionError(f"Connection error: {exc}") from exc
-        except asyncio.TimeoutError as exc:
-            raise QnapTimeoutError("Request timed out") from exc
+        except aiohttp.ClientResponseError as exc:
+            # A supplied session may enable raise_for_status itself.
+            # Suppress its context, which can contain URLs and auth headers.
+            try:
+                self._check_status(
+                    exc.status, expected, invalidate_session=invalidate_session
+                )
+            except (QnapAuthError, QnapPermissionError, QnapAPIError) as error:
+                raise error from None
+            raise QnapAPIError("Invalid HTTP response") from None
+        except TimeoutError:
+            raise QnapTimeoutError("QNAP request timed out") from None
+        except aiohttp.ClientError:
+            raise QnapConnectionError(
+                "QNAP connection failed or was interrupted"
+            ) from None
+        except UnicodeError:
+            raise QnapAPIError("QNAP response could not be decoded") from None
 
     @staticmethod
     def _parse_xml(text: str) -> dict[str, Any]:
         try:
             return xmltodict.parse(text)  # type: ignore[no-any-return]
-        except Exception as exc:
-            raise QnapAPIError(f"Failed to parse XML response: {exc}") from exc
+        except Exception:  # noqa: BLE001
+            # A parser error can include response text, so omit its details.
+            raise QnapAPIError("Failed to parse XML response") from None
 
     def _root(self, text: str) -> dict[str, Any]:
-        return self._parse_xml(text).get("QDocRoot", {})
+        root = self._parse_xml(text).get("QDocRoot")
+        if not isinstance(root, dict):
+            raise QnapAPIError("Response has no QDocRoot object")
+        return root
+
+    @staticmethod
+    def _xml_has_value(root: ElementTree.Element, tag: str, value: str) -> bool:
+        return any((element.text or "").strip() == value for element in root.iter(tag))
+
+    def _check_power_rejection(self, root: ElementTree.Element) -> None:
+        """Recognize QTS XML rejection markers when present."""
+        if self._xml_has_value(root, "PermissionDeny", "1") or self._xml_has_value(
+            root, "errorValue", "-2"
+        ):
+            raise QnapPermissionError("QTS denied the power request")
+        if self._xml_has_value(root, "authPassed", "0"):
+            self._sid = None
+            raise QnapAPIError(
+                "QTS rejected the power request (authPassed 0; cause unknown)"
+            )
+
+    async def _check_shutdown_running(self) -> None:
+        """Refuse a power request unless QTS preflight status is interpretable."""
+        text = await self._get(
+            "/cgi-bin/sys/sysRequest.cgi",
+            {"subfunc": "power_mgmt", "apply": "chk_shutdown_running"},
+        )
+        try:
+            root = ElementTree.fromstring(text)
+        except ElementTree.ParseError:
+            raise QnapAPIError("QTS power preflight response is invalid XML") from None
+
+        self._check_power_rejection(root)
+        items = root.findall(".//item")
+        if not items:
+            raise QnapAPIError("QTS power preflight returned no status items")
+
+        seen: set[str] = set()
+        for item in items:
+            name = (item.findtext("name") or "").strip()
+            status = (item.findtext("status") or "").strip()
+            if name not in _POWER_BLOCKERS or name in seen or status not in {"0", "1"}:
+                raise QnapAPIError("QTS power preflight contains an unknown status")
+            seen.add(name)
+            if status == "1":
+                raise QnapPowerBlockedError(f"QTS reports active {name} work")
+        if seen != _POWER_BLOCKERS:
+            raise QnapAPIError("QTS power preflight is missing status items")
+
+    async def _power_action(self, action: Literal["shutdown", "restart"]) -> None:
+        """Send one QTS power request after its read-only running-work check."""
+        async with self._power_lock:
+            if self._sid is None:
+                raise QnapAuthError("Not logged in — call login() first")
+            await self._check_shutdown_running()
+            if self._sid is None:
+                raise QnapAuthError("QTS session expired before the power request")
+
+            try:
+                text = await self._request(
+                    "POST",
+                    f"{self._base}/cgi-bin/sys/sysRequest.cgi",
+                    params={
+                        "sid": self._sid,
+                        "subfunc": "power_mgmt",
+                        "apply": action,
+                    },
+                )
+            except (QnapConnectionError, QnapTimeoutError):
+                raise QnapPowerOutcomeUnknown(
+                    "Power request outcome is unknown after a connection failure"
+                ) from None
+            finally:
+                # Once POST starts, even an error may race with QTS shutdown.
+                # Prevent context exit from making a logout request to the NAS.
+                self._sid = None
+
+            if not text.strip():
+                return
+            try:
+                root = ElementTree.fromstring(text)
+            except ElementTree.ParseError:
+                raise QnapPowerOutcomeUnknown(
+                    "Power request outcome is unknown after an invalid response"
+                ) from None
+            self._check_power_rejection(root)
+
+    async def shutdown(self) -> None:
+        """Request QTS safe shutdown, without confirming the final power state.
+
+        The preflight checks four CGI flags only; it does not separately check
+        iSCSI, HA, or Live Migration. Physical QTS behavior is unverified.
+        A successful return means an HTTP 2xx response with no recognized
+        rejection marker. It does not prove that the NAS powered off. Do not
+        retry automatically after an uncertain outcome.
+        """
+        await self._power_action("shutdown")
+
+    async def reboot(self) -> None:
+        """Request QTS safe reboot, without confirming the final power state.
+
+        The preflight checks four CGI flags only; it does not separately check
+        iSCSI, HA, or Live Migration. Physical QTS behavior is unverified.
+        A successful return means an HTTP 2xx response with no recognized
+        rejection marker. It does not prove that the NAS restarted. Do not
+        retry automatically after an uncertain outcome.
+        """
+        await self._power_action("restart")
 
     # ------------------------------------------------------------------
     # Public API

@@ -11,6 +11,10 @@ class QnapAuthError(QnapError):
     """Authentication failed — bad credentials or session expired."""
 
 
+class QnapPermissionError(QnapError):
+    """The authenticated account lacks permission for the request."""
+
+
 class QnapConnectionError(QnapError):
     """Could not connect to the NAS."""
 
@@ -21,3 +25,11 @@ class QnapTimeoutError(QnapError):
 
 class QnapAPIError(QnapError):
     """NAS returned an unexpected or malformed response."""
+
+
+class QnapPowerBlockedError(QnapError):
+    """QTS reports work that must finish before shutdown or reboot."""
+
+
+class QnapPowerOutcomeUnknown(QnapError):
+    """A power request may have been accepted; do not retry it automatically."""
