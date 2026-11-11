@@ -13,7 +13,7 @@ The bundled web client in `home/httpd/cgi-bin/js/qos-core-base.js` sends one `PO
 The `qos-core-desktop.js` UI applies checks before either power action:
 
 - The menu is available to administrator-group users. The desktop diverts to the High Availability or Live Migration management app when those modes are active.
-- A read-only `GET` to the same CGI with `apply=chk_shutdown_running` parses XML `item/name` and `item/status`. Status `1` for `Rsync`, `VMs`, or `RTRR` produces a warning; `ssd_cache_upgrading` blocks the UI action.
+- A read-only `GET` to the same CGI with `apply=chk_shutdown_running` parses XML `item/name` and `item/status`. Status `1` for `Rsync`, `VMs`, or `RTRR` produces a warning; `ssd_cache_upgrading` blocks the UI action. The browser accepts a response with only a subset of these items; the proposed library fails closed if any is missing, so live compatibility must be checked.
 - It separately checks iSCSI target connections via `disk/iscsi_portal_setting.cgi`; a `targetStatus` of `1` produces a warning. The warnings for Rsync, VMs, RTRR, and iSCSI allow the user to continue after confirmation.
 - On failed or delayed checks, the web UI can continue to confirmation after 60 seconds with incomplete warning data. The client-side checks do not establish what the final CGI enforces.
 

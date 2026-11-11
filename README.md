@@ -130,7 +130,9 @@ frontend request shape found in QTS 5.2.11.3661 for the TS-431P family: a read-o
 preflight refuses the POST when an XML `item` reports status `1` for `Rsync`,
 `VMs`, `RTRR`, or `ssd_cache_upgrading`, or when its response cannot be
 interpreted, including when any of those four items is missing. The check is
-advisory and cannot prevent work starting between
+stricter than the QTS web UI, which tolerates missing items. It may reject a
+valid response on some devices until their preflight schema is checked. The
+check is advisory and cannot prevent work starting between
 the GET and POST. It covers only those four CGI flags; it does not run separate
 checks for iSCSI, HA, Live Migration, or other services.
 
