@@ -75,12 +75,12 @@ async def server(unused_tcp_port):
 
 
 def power_calls(state):
-    return [
-        call for call in state["calls"] if call[1].endswith("sysRequest.cgi")
-    ]
+    return [call for call in state["calls"] if call[1].endswith("sysRequest.cgi")]
 
 
-@pytest.mark.parametrize("method,apply", [("shutdown", "shutdown"), ("reboot", "restart")])
+@pytest.mark.parametrize(
+    "method,apply", [("shutdown", "shutdown"), ("reboot", "restart")]
+)
 async def test_power_action_uses_qts_route_once_without_logout(server, method, apply):
     port, state = server
     async with QnapClient("127.0.0.1", port, "user", PASSWORD) as client:
@@ -226,11 +226,14 @@ async def test_disconnection_after_post_is_unknown_and_never_retried(server, fai
         with patch.object(session, "request", side_effect=intercept) as request:
             with pytest.raises(QnapPowerOutcomeUnknown) as caught:
                 await client.shutdown()
-            assert sum(
-                call.args[0] == "POST"
-                and call.args[1].endswith("/cgi-bin/sys/sysRequest.cgi")
-                for call in request.call_args_list
-            ) == 1
+            assert (
+                sum(
+                    call.args[0] == "POST"
+                    and call.args[1].endswith("/cgi-bin/sys/sysRequest.cgi")
+                    for call in request.call_args_list
+                )
+                == 1
+            )
         assert client._sid is None
         assert SID not in "".join(traceback.format_exception(caught.value))
         assert PASSWORD not in "".join(traceback.format_exception(caught.value))

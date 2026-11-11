@@ -62,7 +62,9 @@ async def server(unused_tcp_port):
         await runner.cleanup()
 
 
-async def test_login_does_not_log_sid_and_offline_close_sends_no_request(server, caplog):
+async def test_login_does_not_log_sid_and_offline_close_sends_no_request(
+    server, caplog
+):
     port, state = server
     client = QnapClient("127.0.0.1", port, "user", PASSWORD)
     with caplog.at_level(logging.DEBUG):
