@@ -4,7 +4,7 @@ This note records what can be verified without sending a shutdown or restart req
 
 ## QTS 5.2.11 implementation on the TS-431P family
 
-The NAS owner reported QTS **5.2.11.3661**. QNAP's [matching TS-431P family firmware, build 20261023](https://download.qnap.com/Storage/TS-X41/TS-131P_231P_431P_X31%2B_X31K_20261023-5.2.11.3661.zip) was downloaded and inspected locally. ZIP SHA-256: `2cd84ff1721369daa4dd9fbeb3fa24a7daa3c7e6c81b7df4200b7679dd58d7f0`. The image footer identifies the `TS-X41` family and version `5.2.11`. [QNAP's release notes](https://www.qnap.com/en/release-notes/qts/overview/5.2.0) list this build. No firmware files are included in this repository, and no NAS was contacted.
+The NAS owner reported QTS **5.2.11.3661**. QNAP's [matching TS-431P family firmware, build 20261023](https://download.qnap.com/Storage/TS-X41/TS-131P_231P_431P_X31%2B_X31K_20261023-5.2.11.3661.zip) was downloaded and inspected locally. ZIP SHA-256: `2cd84ff1721369daa4dd9fbeb3fa24a7daa3c7e6c81b7df4200b7679dd58d7f0`. The image footer identifies the `TS-X41` family and version `5.2.11`. [QNAP's release notes](https://www.qnap.com/en/release-notes/qts/overview/5.2.0) list this build. This firmware inspection used local files. The owner later ran an authentication-only diagnostic against the NAS, which stopped before the power preflight. Physical power-action validation remains pending.
 
 The earlier [TS-431P family firmware, build 5.2.7.3256](https://download.qnap.com/Storage/TS-131P_231P_431P_X31%2B_X31K/TS-131P_231P_431P_X31%2B_X31K_20250913-5.2.7.3256.zip) was used as a comparison. ZIP SHA-256: `95d0eae7f9804a89594229c603d030f960104941107f2721355dd4f7680218d1`. The full JavaScript files differ across builds, but the relevant function bodies were compared textually and are unchanged: `rebootNas`/`shutdownNas` in `qos-core-base.js`, `getCgiUrl` in `qos-lib.js`, and the desktop's power actions, preflight, confirmation, and iSCSI target-store definition. The bundled `sysRequest.cgi` binaries differ, so unchanged browser code does not prove identical server-side behavior.
 
@@ -13,11 +13,25 @@ The bundled web client in `home/httpd/cgi-bin/js/qos-core-base.js` sends one `PO
 The `qos-core-desktop.js` UI applies checks before either power action:
 
 - The menu is available to administrator-group users. The desktop diverts to the High Availability or Live Migration management app when those modes are active.
-- A read-only `GET` to the same CGI with `apply=chk_shutdown_running` parses XML `item/name` and `item/status`. Status `1` for `Rsync`, `VMs`, or `RTRR` produces a warning; `ssd_cache_upgrading` blocks the UI action. The browser accepts a response with only a subset of these items; the proposed library fails closed if any is missing, so live compatibility must be checked.
+- A read-only `GET` to the same CGI with `apply=chk_shutdown_running` parses XML `item/name` and `item/status`. Status `1` for `Rsync`, `VMs`, or `RTRR` produces a warning. `ssd_cache_upgrading` blocks the UI action. The browser accepts a response with a subset of these items.
 - It separately checks iSCSI target connections via `disk/iscsi_portal_setting.cgi`; a `targetStatus` of `1` produces a warning. The warnings for Rsync, VMs, RTRR, and iSCSI allow the user to continue after confirmation.
 - On failed or delayed checks, the web UI can continue to confirmation after 60 seconds with incomplete warning data. The client-side checks do not establish what the final CGI enforces.
 
 The bundled `sysRequest.cgi` binary contains action and preflight strings, but static string inspection did not establish its response schema, error codes, administrator enforcement, or whether it independently blocks active jobs. An [older third-party Go client](https://github.com/mkch/qnap-tool/blob/main/qnap/qnap.go#L394-L444) also sends a POST to the shutdown URL and expects XML `authPassed`; it is not proof of the response on QTS 5.2.11.3661.
+
+## Draft behavior after review
+
+The library methods send a single power POST. Service warnings belong to the
+QTS UI flow and require a validated status API before they can be offered to a
+caller. The earlier implementation's requirement for exactly four status items
+and its hard block on every warning were removed during review.
+
+Every HTTP 2xx power response currently raises `QnapPowerOutcomeUnknown` until
+the acceptance contract is established. The draft also treats redirects,
+server errors, decoding errors, and interrupted POST responses as uncertain.
+HTTP 401 and 403 retain their HTTP authentication/permission meanings. Other
+HTTP 4xx errors expose only their numeric status. The draft does not transfer
+the authentication endpoint's XML error meanings to the power CGI.
 
 ## Authentication and scope
 

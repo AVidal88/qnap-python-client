@@ -30,9 +30,9 @@ class QnapTimeoutError(QnapError):
 class QnapAPIError(QnapError):
     """NAS returned an unexpected or malformed response."""
 
-
-class QnapPowerBlockedError(QnapError):
-    """QTS reports work that must finish before shutdown or reboot."""
+    def __init__(self, *args: object, http_status: int | None = None) -> None:
+        super().__init__(*args)
+        self.http_status = http_status
 
 
 class QnapPowerOutcomeUnknown(QnapError):

@@ -61,6 +61,7 @@ QnapClient(
 |---|---|---|
 | `login()` | `None` | Authenticate and store session ID |
 | `logout()` | `None` | Log out and clear session |
+| `close(logout=True)` | `None` | Release an owned HTTP session, optionally without a logout request |
 | `get_system_info()` | `SystemInfo` | CPU, memory, firmware version, uptime |
 | `get_system_health()` | `SystemHealth` | Overall health status string |
 | `get_network_interfaces()` | `list[NetworkInterface]` | Per-interface RX/TX rates |
@@ -69,9 +70,13 @@ QnapClient(
 | `get_firmware_update()` | `FirmwareUpdate` | Current + latest firmware version |
 | `get_fans()` | `list[FanStatus]` | Fan speed RPM (empty list if unsupported) |
 | `get_external_drives()` | `list[ExternalDrive]` | External USB/eSATA drives |
-| `get_all()` | `NasData` | All of the above in parallel |
-| `shutdown()` | `None` | Request QTS safe shutdown after a read-only running-work check |
-| `reboot()` | `None` | Request QTS safe restart after a read-only running-work check |
+| `get_all()` | `NasData` | Parallel reads, with system information required for a successful refresh |
+| `shutdown()` | `None` | Draft QTS shutdown request, currently reports an unverified outcome |
+| `reboot()` | `None` | Draft QTS restart request, currently reports an unverified outcome |
+
+`get_all()` propagates a failed system-information read so an unreachable NAS
+can be reported as unavailable. Optional section failures retain their existing
+defaults and log the exception type.
 
 ### `ContainerStationClient`
 
@@ -98,7 +103,7 @@ async with QnapClient(...) as client:
 |---|---|
 | `SystemInfo` | `name`, `model`, `serial_number`, `firmware_version`, `uptime_seconds`, `cpu_usage_percent`, `memory_total_mb`, `memory_free_mb`, `memory_used_mb` |
 | `SystemHealth` | `status` |
-| `NetworkInterface` | `name`, `mac`, `ip`, `rx_bytes_per_sec`, `tx_bytes_per_sec` |
+| `NetworkInterface` | `name`, `mac`, `ip`, `mask`, `link_status`, `max_speed`, RX/TX rates and packet counts |
 | `DriveHealth` | `drive_number`, `model`, `health`, `temperature` |
 | `VolumeStats` | `name`, `total_bytes`, `used_bytes`, `free_bytes`, `status` |
 | `FirmwareUpdate` | `current_version`, `latest_version` (None = up to date) |
@@ -114,47 +119,42 @@ async with QnapClient(...) as client:
 | `QnapError` | Base exception |
 | `QnapAuthError` | Bad credentials or session expired |
 | `QnapTwoStepRequiredError` | QTS requires a second login factor; password-only login cannot complete it |
-| `QnapPermissionError` | Request forbidden (HTTP 403 or explicit QTS denial) |
+| `QnapPermissionError` | Request forbidden by HTTP 403 |
 | `QnapConnectionError` | NAS unreachable |
 | `QnapTimeoutError` | Request timed out |
 | `QnapAPIError` | Unexpected or malformed API response |
-| `QnapPowerBlockedError` | QTS preflight reports running work |
 | `QnapPowerOutcomeUnknown` | A power request may have been accepted; never retry automatically |
 
 ## Power actions — validation pending
 
-`shutdown()` and `reboot()` send real QTS power commands. This draft follows the
-frontend request shape found in QTS 5.2.11.3661 for the TS-431P family: a read-only GET to
-`/cgi-bin/sys/sysRequest.cgi` with `subfunc=power_mgmt` and
-`apply=chk_shutdown_running`, followed by one POST to the same CGI with
-`apply=shutdown` or `apply=restart`. Both use the existing QTS session ID. The
-preflight refuses the POST when an XML `item` reports status `1` for `Rsync`,
-`VMs`, `RTRR`, or `ssd_cache_upgrading`, or when its response cannot be
-interpreted, including when any of those four items is missing. The check is
-stricter than the QTS web UI, which tolerates missing items. It may reject a
-valid response on some devices until their preflight schema is checked. The
-check is advisory and cannot prevent work starting between
-the GET and POST. It covers only those four CGI flags; it does not run separate
-checks for iSCSI, HA, Live Migration, or other services.
+`shutdown()` and `reboot()` send real power commands using the request found in
+the TS-431P-family QTS 5.2.11.3661 web client. Each sends one authenticated POST
+to `/cgi-bin/sys/sysRequest.cgi` with `subfunc=power_mgmt` and `apply=shutdown`
+or `apply=restart`.
 
-An HTTP 2xx response without an explicit rejection marker means only that the
-HTTP exchange completed; it does **not** confirm that the NAS shut down or
-restarted. The actual QTS power response body, permissions, and the behavior of
-QTS 5.2.11.3661 and QuTS hero have not been verified on a physical NAS.
-The `authPassed`, `PermissionDeny`, and `errorValue` markers are documented for
-QTS authentication responses; their presence and meaning in the power CGI are
-not verified. The draft conservatively treats `PermissionDeny=1` or
-`errorValue=-2` as permission denial, even when the same XML contains
-`authPassed=0`. The meaning of `authPassed=0` alone for this CGI is not
-established; it raises a generic rejection error without automatic
-reauthentication. Other response formats may exist. A connection
-drop or timeout after starting the POST raises `QnapPowerOutcomeUnknown`.
-An unparseable nonempty POST response does the same. Never retry these actions
-automatically. Cancellation during the POST also leaves the outcome unknown;
-the cancellation propagates and must not trigger a retry. Every attempted POST
-clears the local session ID so context
-exit does not attempt logout while QTS may be going offline. The tests use synthetic
-loopback responses and prove transport behavior only, not firmware compatibility.
+**This draft raises `QnapPowerOutcomeUnknown` after every HTTP 2xx response.**
+The power CGI's acceptance response has yet to be established on a physical
+NAS. Empty bodies, XML, and authentication-endpoint markers cannot currently
+establish acceptance. A future validated response contract can enable a normal
+return. The methods are pending device validation before release.
+
+HTTP 401 and 403 raise authentication and permission errors. Other HTTP 4xx
+responses raise `QnapAPIError` with a numeric `http_status` attribute. Connection
+loss, timeout, redirects, HTTP 5xx, and undecodable responses after starting the
+POST report an unknown outcome. Cancellation propagates with the same outcome
+uncertainty. Every attempted POST clears the local SID so context exit can close
+the client while QTS goes offline. Callers must observe the NAS state before
+any further action and must never retry a power command automatically.
+
+The QTS web UI has separate service warnings and checks for running jobs,
+iSCSI, High Availability, and Live Migration. These draft methods do not run
+those UI checks. Their response schemas and applicable models still require
+device evidence. QuTS hero compatibility is also pending. See the
+[firmware evidence and device validation plan](docs/power-api-evidence.md).
+
+The tests use synthetic loopback responses to verify request shape, single
+submission, error handling, and session cleanup. Device compatibility remains
+pending.
 
 Password-only login cannot complete QTS two-step verification. If the login
 response contains `need_2sv=1` or `need_2_step_verification=1`, the client raises
@@ -173,7 +173,9 @@ This library is the backing library for the [QNAP NAS Integration for Home Assis
 
 ## Contributing
 
-PRs welcome. This library is actively maintained. If your QNAP model returns unexpected data, open an issue with the raw API response and we'll fix it.
+PRs welcome. If your QNAP model returns unexpected data, include the model,
+firmware version, and a sanitized response sample in an issue. Remove passwords,
+SIDs, tokens, cookies, and identifying device details before sharing it.
 
 ## License
 

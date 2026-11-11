@@ -1,24 +1,19 @@
 """Container Station async client for QNAP NAS.
 
 Uses the QNAP Container Station REST API:
-- v3 API (list containers): QTS SID as Bearer token
-- v1 API (start/stop/restart): CS_SESS_ID cookie via separate CS login
+- v3 API (list and actions): QTS SID as Bearer token
 """
 
 from __future__ import annotations
 
-import logging
+import json
 from typing import TYPE_CHECKING, Any
 
-import aiohttp
-
-from .exceptions import QnapAPIError, QnapAuthError, QnapConnectionError
+from .exceptions import QnapAPIError, QnapAuthError
 from .models import Container
 
 if TYPE_CHECKING:
     from .client import QnapClient
-
-_LOGGER = logging.getLogger(__name__)
 
 
 class ContainerStationClient:
@@ -70,23 +65,17 @@ class ContainerStationClient:
             QnapAPIError: On bad response.
             QnapConnectionError: On network failure.
         """
-        session = await self._client._ensure_session()  # noqa: SLF001
+        text = await self._client._request(  # noqa: SLF001
+            "GET",
+            f"{self._base_v3}/containers",
+            headers=self._bearer_headers(),
+            expected=(200,),
+            invalidate_session=False,
+        )
         try:
-            async with session.get(
-                f"{self._base_v3}/containers",
-                headers=self._bearer_headers(),
-            ) as resp:
-                if resp.status == 401:
-                    raise QnapAuthError("Container Station: Bearer token rejected")
-                if resp.status != 200:
-                    raise QnapAPIError(
-                        f"Container Station list failed: HTTP {resp.status}"
-                    )
-                data: dict[str, Any] = await resp.json()
-        except aiohttp.ClientConnectorError as err:
-            raise QnapConnectionError(
-                f"Cannot connect to Container Station: {err}"
-            ) from err
+            data: dict[str, Any] = json.loads(text)
+        except ValueError:
+            raise QnapAPIError("Invalid Container Station JSON response") from None
 
         items_raw: list[dict[str, Any]] = data.get("data", {}).get("items", [])
         return [
@@ -121,26 +110,14 @@ class ContainerStationClient:
                 f"Invalid container action: {action!r}. Must be start, stop, or restart."
             )
 
-        session = await self._client._ensure_session()  # noqa: SLF001
         url = f"{self._base_v3}/containers/{container_type}/{container_id}/{action}"
-
-        try:
-            async with session.post(
-                url, headers=self._bearer_headers()
-            ) as resp:
-                if resp.status == 401:
-                    raise QnapAuthError(
-                        f"Container Station: Bearer token rejected for {action}"
-                    )
-                if resp.status not in (200, 204):
-                    body = await resp.text()
-                    raise QnapAPIError(
-                        f"Container {action} failed: HTTP {resp.status} — {body[:200]}"
-                    )
-        except aiohttp.ClientConnectorError as err:
-            raise QnapConnectionError(
-                f"Cannot connect to Container Station: {err}"
-            ) from err
+        await self._client._request(  # noqa: SLF001
+            "POST",
+            url,
+            headers=self._bearer_headers(),
+            expected=(200, 204),
+            invalidate_session=False,
+        )
 
     async def start_container(
         self, container_id: str, container_type: str = "docker"

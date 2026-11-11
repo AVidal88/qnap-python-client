@@ -10,7 +10,6 @@ from .exceptions import (
     QnapConnectionError,
     QnapError,
     QnapPermissionError,
-    QnapPowerBlockedError,
     QnapPowerOutcomeUnknown,
     QnapTimeoutError,
     QnapTwoStepRequiredError,
@@ -38,7 +37,6 @@ __all__ = [
     # Exceptions
     "QnapError",
     "QnapPermissionError",
-    "QnapPowerBlockedError",
     "QnapPowerOutcomeUnknown",
     "QnapTwoStepRequiredError",
     "QnapAuthError",

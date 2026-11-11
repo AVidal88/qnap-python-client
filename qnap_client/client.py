@@ -6,7 +6,6 @@ import asyncio
 import base64
 import logging
 from typing import Any, Literal, Self
-from xml.etree import ElementTree
 
 import aiohttp
 import xmltodict
@@ -16,7 +15,6 @@ from .exceptions import (
     QnapAuthError,
     QnapConnectionError,
     QnapPermissionError,
-    QnapPowerBlockedError,
     QnapPowerOutcomeUnknown,
     QnapTimeoutError,
     QnapTwoStepRequiredError,
@@ -36,7 +34,6 @@ from .models import (
 )
 
 _LOGGER = logging.getLogger(__name__)
-_POWER_BLOCKERS = frozenset({"Rsync", "VMs", "RTRR", "ssd_cache_upgrading"})
 
 
 class QnapClient:
@@ -139,9 +136,10 @@ class QnapClient:
         )
 
         root = self._root(text)
-        if str(root.get("need_2sv", "0")) == "1" or str(
-            root.get("need_2_step_verification", "0")
-        ) == "1":
+        if (
+            str(root.get("need_2sv", "0")) == "1"
+            or str(root.get("need_2_step_verification", "0")) == "1"
+        ):
             raise QnapTwoStepRequiredError(
                 "QTS requires two-step verification; password-only login is unsupported"
             )
@@ -195,7 +193,9 @@ class QnapClient:
         if status == 403:
             raise QnapPermissionError("Permission denied (HTTP 403)")
         if not 200 <= status < 300 or (expected is not None and status not in expected):
-            raise QnapAPIError(f"QNAP request failed (HTTP {status})")
+            raise QnapAPIError(
+                f"QNAP request failed (HTTP {status})", http_status=status
+            )
 
     async def _request(
         self,
@@ -256,61 +256,14 @@ class QnapClient:
             raise QnapAPIError("Response has no QDocRoot object")
         return root
 
-    @staticmethod
-    def _xml_has_value(root: ElementTree.Element, tag: str, value: str) -> bool:
-        return any((element.text or "").strip() == value for element in root.iter(tag))
-
-    def _check_power_rejection(self, root: ElementTree.Element) -> None:
-        """Recognize QTS XML rejection markers when present."""
-        if self._xml_has_value(root, "PermissionDeny", "1") or self._xml_has_value(
-            root, "errorValue", "-2"
-        ):
-            raise QnapPermissionError("QTS denied the power request")
-        if self._xml_has_value(root, "authPassed", "0"):
-            self._sid = None
-            raise QnapAPIError(
-                "QTS rejected the power request (authPassed 0; cause unknown)"
-            )
-
-    async def _check_shutdown_running(self) -> None:
-        """Refuse a power request unless QTS preflight status is interpretable."""
-        text = await self._get(
-            "/cgi-bin/sys/sysRequest.cgi",
-            {"subfunc": "power_mgmt", "apply": "chk_shutdown_running"},
-        )
-        try:
-            root = ElementTree.fromstring(text)
-        except ElementTree.ParseError:
-            raise QnapAPIError("QTS power preflight response is invalid XML") from None
-
-        self._check_power_rejection(root)
-        items = root.findall(".//item")
-        if not items:
-            raise QnapAPIError("QTS power preflight returned no status items")
-
-        seen: set[str] = set()
-        for item in items:
-            name = (item.findtext("name") or "").strip()
-            status = (item.findtext("status") or "").strip()
-            if name not in _POWER_BLOCKERS or name in seen or status not in {"0", "1"}:
-                raise QnapAPIError("QTS power preflight contains an unknown status")
-            seen.add(name)
-            if status == "1":
-                raise QnapPowerBlockedError(f"QTS reports active {name} work")
-        if seen != _POWER_BLOCKERS:
-            raise QnapAPIError("QTS power preflight is missing status items")
-
     async def _power_action(self, action: Literal["shutdown", "restart"]) -> None:
-        """Send one QTS power request after its read-only running-work check."""
+        """Send one power request and report the unverified QTS outcome."""
         async with self._power_lock:
             if self._sid is None:
                 raise QnapAuthError("Not logged in — call login() first")
-            await self._check_shutdown_running()
-            if self._sid is None:
-                raise QnapAuthError("QTS session expired before the power request")
 
             try:
-                text = await self._request(
+                await self._request(
                     "POST",
                     f"{self._base}/cgi-bin/sys/sysRequest.cgi",
                     params={
@@ -323,40 +276,40 @@ class QnapClient:
                 raise QnapPowerOutcomeUnknown(
                     "Power request outcome is unknown after a connection failure"
                 ) from None
+            except QnapAPIError as error:
+                if error.http_status is not None and 400 <= error.http_status < 500:
+                    raise
+                raise QnapPowerOutcomeUnknown(
+                    "Power request outcome is unknown after an unexpected response"
+                ) from None
             finally:
                 # Once POST starts, even an error may race with QTS shutdown.
                 # Prevent context exit from making a logout request to the NAS.
                 self._sid = None
 
-            if not text.strip():
-                return
-            try:
-                root = ElementTree.fromstring(text)
-            except ElementTree.ParseError:
-                raise QnapPowerOutcomeUnknown(
-                    "Power request outcome is unknown after an invalid response"
-                ) from None
-            self._check_power_rejection(root)
+            # The official web client ignores the POST body. No successful
+            # response contract has been validated for this CGI yet.
+            raise QnapPowerOutcomeUnknown(
+                "QTS returned HTTP 2xx, but power request acceptance is unverified"
+            )
 
     async def shutdown(self) -> None:
         """Request QTS safe shutdown, without confirming the final power state.
 
-        The preflight checks four CGI flags only; it does not separately check
-        iSCSI, HA, or Live Migration. Physical QTS behavior is unverified.
-        A successful return means an HTTP 2xx response with no recognized
-        rejection marker. It does not prove that the NAS powered off. Do not
-        retry automatically after an uncertain outcome.
+        This draft raises QnapPowerOutcomeUnknown even after HTTP 2xx until
+        the CGI response contract is validated. QTS web UI warnings about
+        running services are not checked here. Observe the device state and
+        never retry automatically after an uncertain outcome.
         """
         await self._power_action("shutdown")
 
     async def reboot(self) -> None:
         """Request QTS safe reboot, without confirming the final power state.
 
-        The preflight checks four CGI flags only; it does not separately check
-        iSCSI, HA, or Live Migration. Physical QTS behavior is unverified.
-        A successful return means an HTTP 2xx response with no recognized
-        rejection marker. It does not prove that the NAS restarted. Do not
-        retry automatically after an uncertain outcome.
+        This draft raises QnapPowerOutcomeUnknown even after HTTP 2xx until
+        the CGI response contract is validated. QTS web UI warnings about
+        running services are not checked here. Observe the device state and
+        never retry automatically after an uncertain outcome.
         """
         await self._power_action("restart")
 
@@ -513,7 +466,9 @@ class QnapClient:
                     "err_packets": err_packets,
                 }
             except (ValueError, TypeError) as exc:
-                _LOGGER.debug("Skipping NIC meta for %s: %s", iface_name, exc)
+                _LOGGER.debug(
+                    "Skipping NIC meta for %s: %s", iface_name, type(exc).__name__
+                )
 
         # Merge bandwidth + metadata
         results: list[NetworkInterface] = []
@@ -542,7 +497,7 @@ class QnapClient:
                     )
                     seen.add(key)
                 except (ValueError, TypeError) as exc:
-                    _LOGGER.debug("Skipping interface %s: %s", key, exc)
+                    _LOGGER.debug("Skipping interface: %s", type(exc).__name__)
 
         # Add any NICs from sysinfo that weren't in bandwidth data
         for iface_name, meta in nic_meta.items():
@@ -677,7 +632,7 @@ class QnapClient:
                 rpm = int(val.get("speed_rpm", val.get("rpm", 0)))
                 results.append(FanStatus(fan_number=i + 1, speed_rpm=rpm))
             except (ValueError, TypeError) as exc:
-                _LOGGER.debug("Skipping fan entry %d: %s", i, exc)
+                _LOGGER.debug("Skipping fan entry %d: %s", i, type(exc).__name__)
 
         return results
 
@@ -715,7 +670,7 @@ class QnapClient:
         return results
 
     async def get_all(self) -> NasData:
-        """Fetch all NAS data in parallel and return a NasData aggregate."""
+        """Fetch NAS data in parallel, requiring a successful system-info read."""
         (
             system_info,
             system_health,
@@ -741,14 +696,19 @@ class QnapClient:
             return_exceptions=True,
         )
 
+        if isinstance(system_info, BaseException):
+            raise system_info
+
         def _unwrap(result: Any, default: Any) -> Any:
+            if isinstance(result, asyncio.CancelledError):
+                raise result
             if isinstance(result, Exception):
-                _LOGGER.warning("get_all partial failure: %s", result)
+                _LOGGER.warning("get_all partial failure: %s", type(result).__name__)
                 return default
             return result
 
         return NasData(
-            system_info=_unwrap(system_info, SystemInfo("", "", "", "", 0)),
+            system_info=system_info,
             system_health=_unwrap(system_health, SystemHealth("Unknown")),
             cpu=_unwrap(cpu, CpuStats(usage_percent=0.0)),
             memory=_unwrap(memory, MemoryStats(0, 0, 0)),

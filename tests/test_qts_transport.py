@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import traceback
-from unittest.mock import patch
+from contextlib import ExitStack
+from unittest.mock import AsyncMock, patch
 
 import aiohttp
 import pytest
 from aiohttp import web
 
 from qnap_client import (
+    ContainerStationClient,
     QnapAPIError,
     QnapAuthError,
     QnapClient,
@@ -20,6 +23,7 @@ from qnap_client import (
     QnapTimeoutError,
     QnapTwoStepRequiredError,
 )
+from qnap_client.models import SystemInfo
 
 SID = "synthetic-secret-sid"
 PASSWORD = "synthetic-secret-password"
@@ -39,7 +43,13 @@ def assert_no_secrets(value: BaseException | str) -> None:
 
 @pytest.fixture
 async def server(unused_tcp_port):
-    state = {"login_status": 200, "login_body": LOGIN_OK, "status": 200, "calls": []}
+    state = {
+        "login_status": 200,
+        "login_body": LOGIN_OK,
+        "status": 200,
+        "cs_body": '{"data":{"items":[]}}',
+        "calls": [],
+    }
 
     async def handle(request):
         state["calls"].append((request.method, request.path, dict(request.query)))
@@ -47,6 +57,9 @@ async def server(unused_tcp_port):
             return web.Response(status=state["login_status"], text=state["login_body"])
         if state["status"] == 302:
             return web.Response(status=302, headers={"Location": "/redirect-target"})
+        if request.path.startswith("/container-station/api/"):
+            assert request.headers.get("Authorization") == f"Bearer {SID}"
+            return web.Response(status=state["status"], text=state["cs_body"])
         return web.Response(
             status=state["status"],
             text=f"<QDocRoot><hostname>{SID}</hostname></QDocRoot>",
@@ -223,3 +236,199 @@ async def test_supplied_session_keeps_ownership_and_receives_transport_options(s
         assert request.call_args.kwargs["timeout"].total == 3
         await client.close(logout=False)
         assert not session.closed
+
+
+OPTIONAL_READS = (
+    "get_system_health",
+    "get_cpu_stats",
+    "get_memory_stats",
+    "get_network_interfaces",
+    "get_drive_health",
+    "get_volumes",
+    "get_firmware_update",
+    "get_fans",
+    "get_external_drives",
+)
+INFO = SystemInfo("TS-431P", "NAS", "synthetic-serial", "5.2.11", 100)
+
+
+@pytest.mark.parametrize(
+    "error_type", [QnapConnectionError, QnapAuthError, QnapAPIError]
+)
+async def test_get_all_propagates_core_read_failure(error_type):
+    client = QnapClient("127.0.0.1", 1, "user", PASSWORD)
+    error = error_type("Core read failed")
+    with ExitStack() as patches:
+        for name in OPTIONAL_READS:
+            patches.enter_context(
+                patch.object(client, name, AsyncMock(return_value=None))
+            )
+        patches.enter_context(
+            patch.object(client, "get_system_info", AsyncMock(side_effect=error))
+        )
+        with pytest.raises(error_type) as caught:
+            await client.get_all()
+    assert caught.value is error
+
+
+async def test_get_all_preserves_optional_defaults_without_logging_response_values(
+    caplog,
+):
+    client = QnapClient("127.0.0.1", 1, "user", PASSWORD)
+    with ExitStack() as patches:
+        for name in OPTIONAL_READS:
+            patches.enter_context(
+                patch.object(
+                    client,
+                    name,
+                    AsyncMock(side_effect=QnapAPIError(f"{SID} {PASSWORD}")),
+                )
+            )
+        patches.enter_context(
+            patch.object(client, "get_system_info", AsyncMock(return_value=INFO))
+        )
+        with caplog.at_level(logging.WARNING):
+            data = await client.get_all()
+    assert data.system_info is INFO
+    assert data.network_interfaces == []
+    assert data.firmware is None
+    assert "QnapAPIError" in caplog.text
+    assert_no_secrets(caplog.text)
+
+
+async def test_get_all_propagates_cancelled_optional_read():
+    client = QnapClient("127.0.0.1", 1, "user", PASSWORD)
+    with ExitStack() as patches:
+        for name in OPTIONAL_READS:
+            patches.enter_context(
+                patch.object(client, name, AsyncMock(return_value=None))
+            )
+        patches.enter_context(
+            patch.object(client, "get_system_info", AsyncMock(return_value=INFO))
+        )
+        patches.enter_context(
+            patch.object(
+                client, "get_fans", AsyncMock(side_effect=asyncio.CancelledError())
+            )
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await client.get_all()
+
+
+async def test_malformed_network_values_are_not_logged(caplog):
+    client = QnapClient("127.0.0.1", 1, "user", PASSWORD)
+    with (
+        patch.object(
+            client,
+            "_get",
+            AsyncMock(
+                side_effect=[
+                    f"<QDocRoot><net><eth0><rx>{PASSWORD}</rx></eth0></net></QDocRoot>",
+                    "<QDocRoot><func><ownContent><root><nic_cnt>0</nic_cnt></root></ownContent></func></QDocRoot>",
+                ]
+            ),
+        ),
+        caplog.at_level(logging.DEBUG),
+    ):
+        assert await client.get_network_interfaces() == []
+    assert "ValueError" in caplog.text
+    assert_no_secrets(caplog.text)
+
+
+async def test_malformed_fan_values_are_not_logged(caplog):
+    client = QnapClient("127.0.0.1", 1, "user", PASSWORD)
+    with (
+        patch.object(
+            client,
+            "_get",
+            AsyncMock(
+                return_value=f"<QDocRoot><sysfan><fan><rpm>{PASSWORD}</rpm></fan></sysfan></QDocRoot>"
+            ),
+        ),
+        caplog.at_level(logging.DEBUG),
+    ):
+        assert await client.get_fans() == []
+    assert "ValueError" in caplog.text
+    assert_no_secrets(caplog.text)
+
+
+@pytest.mark.parametrize("operation", ["list", "action"])
+async def test_container_auth_failure_preserves_qts_session(server, operation):
+    port, state = server
+    client = QnapClient("127.0.0.1", port, "user", PASSWORD)
+    try:
+        await client.login()
+        state["status"] = 401
+        cs = ContainerStationClient(client)
+        with pytest.raises(QnapAuthError) as caught:
+            if operation == "list":
+                await cs.get_containers()
+            else:
+                await cs.stop_container("test-container")
+        assert client._sid == SID
+        assert_no_secrets(caught.value)
+        assert len(state["calls"]) == 2
+    finally:
+        await client.close(logout=False)
+
+
+@pytest.mark.parametrize("operation", ["list", "action"])
+async def test_container_error_response_cannot_expose_response_values(
+    server, operation
+):
+    port, state = server
+    client = QnapClient("127.0.0.1", port, "user", PASSWORD)
+    try:
+        await client.login()
+        state["status"] = 500
+        state["cs_body"] = f"{SID} {PASSWORD}"
+        cs = ContainerStationClient(client)
+        with pytest.raises(QnapAPIError) as caught:
+            if operation == "list":
+                await cs.get_containers()
+            else:
+                await cs.stop_container("test-container")
+        assert_no_secrets(caught.value)
+        assert len(state["calls"]) == 2
+    finally:
+        await client.close(logout=False)
+
+
+async def test_container_invalid_json_is_sanitized(server):
+    port, state = server
+    client = QnapClient("127.0.0.1", port, "user", PASSWORD)
+    try:
+        await client.login()
+        state["cs_body"] = f"{SID} {PASSWORD}"
+        with pytest.raises(QnapAPIError) as caught:
+            await ContainerStationClient(client).get_containers()
+        assert_no_secrets(caught.value)
+    finally:
+        await client.close(logout=False)
+
+
+async def test_container_list_and_stop_preserve_existing_request_shapes(server):
+    port, state = server
+    client = QnapClient("127.0.0.1", port, "user", PASSWORD)
+    try:
+        await client.login()
+        state["cs_body"] = (
+            '{"data":{"items":[{"id":"test-container","name":"web",'
+            '"status":"running","image":"test"}]}}'
+        )
+        cs = ContainerStationClient(client)
+        containers = await cs.get_containers()
+        assert containers[0].state == "running"
+        state["status"] = 204
+        state["cs_body"] = ""
+        await cs.stop_container(containers[0].id)
+        assert state["calls"][1:] == [
+            ("GET", "/container-station/api/v3/containers", {}),
+            (
+                "POST",
+                "/container-station/api/v3/containers/docker/test-container/stop",
+                {},
+            ),
+        ]
+    finally:
+        await client.close(logout=False)
