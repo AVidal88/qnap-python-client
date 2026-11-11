@@ -13,6 +13,7 @@ from .exceptions import (
     QnapPowerBlockedError,
     QnapPowerOutcomeUnknown,
     QnapTimeoutError,
+    QnapTwoStepRequiredError,
 )
 from .models import (
     Container,
@@ -39,6 +40,7 @@ __all__ = [
     "QnapPermissionError",
     "QnapPowerBlockedError",
     "QnapPowerOutcomeUnknown",
+    "QnapTwoStepRequiredError",
     "QnapAuthError",
     "QnapConnectionError",
     "QnapTimeoutError",

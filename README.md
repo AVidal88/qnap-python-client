@@ -113,6 +113,7 @@ async with QnapClient(...) as client:
 |---|---|
 | `QnapError` | Base exception |
 | `QnapAuthError` | Bad credentials or session expired |
+| `QnapTwoStepRequiredError` | QTS requires a second login factor; password-only login cannot complete it |
 | `QnapPermissionError` | Request forbidden (HTTP 403 or explicit QTS denial) |
 | `QnapConnectionError` | NAS unreachable |
 | `QnapTimeoutError` | Request timed out |
@@ -154,6 +155,11 @@ the cancellation propagates and must not trigger a retry. Every attempted POST
 clears the local session ID so context
 exit does not attempt logout while QTS may be going offline. The tests use synthetic
 loopback responses and prove transport behavior only, not firmware compatibility.
+
+Password-only login cannot complete QTS two-step verification. If the login
+response contains `need_2sv=1` or `need_2_step_verification=1`, the client raises
+`QnapTwoStepRequiredError` without retrying. This recognizes documented QTS
+challenge flags; it does not implement a second-factor flow.
 
 ## HTTPS / Self-Signed Certificates
 

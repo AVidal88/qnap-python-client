@@ -19,6 +19,7 @@ from .exceptions import (
     QnapPowerBlockedError,
     QnapPowerOutcomeUnknown,
     QnapTimeoutError,
+    QnapTwoStepRequiredError,
 )
 from .models import (
     CpuStats,
@@ -138,6 +139,12 @@ class QnapClient:
         )
 
         root = self._root(text)
+        if str(root.get("need_2sv", "0")) == "1" or str(
+            root.get("need_2_step_verification", "0")
+        ) == "1":
+            raise QnapTwoStepRequiredError(
+                "QTS requires two-step verification; password-only login is unsupported"
+            )
         auth_passed = root.get("authPassed", "0")
         if str(auth_passed) != "1":
             raise QnapAuthError("Login failed — check username and password")

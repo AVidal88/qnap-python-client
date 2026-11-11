@@ -11,6 +11,10 @@ class QnapAuthError(QnapError):
     """Authentication failed — bad credentials or session expired."""
 
 
+class QnapTwoStepRequiredError(QnapAuthError):
+    """The account requires a second login factor unsupported by this client."""
+
+
 class QnapPermissionError(QnapError):
     """The authenticated account lacks permission for the request."""
 

@@ -23,6 +23,8 @@ The bundled `sysRequest.cgi` binary contains action and preflight strings, but s
 
 QNAP's [HTTP API Authentication v5.1.0](https://eu1.qnap.com/dev/QTS_HTTP_API-Authentication_v5.1.0.pdf) documents `authLogin.cgi` issuing `authSid`, `authPassed`, and `isAdmin`; its examples include `PermissionDeny` and `errorValue=-2` for a non-administrator. It also documents read-only validation with `authLogin.cgi?sid=<sid>`. These examples describe the authentication endpoint, **not** the power-action response. A password or qtoken is used to obtain a SID; the observed action request contains a SID, not the password. Neither credentials nor SIDs should appear in logs, exceptions, or shared diagnostics.
 
+The same QNAP document shows that a password accepted as the first step of two-step verification may return `authPassed=0` with `need_2sv=1`. It also documents `need_2_step_verification=1` for the newer flow. The proposed client detects those flags and reports a specific unsupported-login error; it does not bypass or complete MFA. A password-only failure on the owner's NAS is compatible with MFA, but the response flags have not yet been inspected there.
+
 QNAP's [QTS 5.2.x user guide](https://docs.qnap.com/operating-system/qts/5.2.x/en-us/task-bar-33FA3D49.html) calls the UI actions a restart and an orderly shutdown of QTS before power off. The [QuTS hero h5.2.x guide](https://docs.qnap.com/operating-system/quts-hero/5.2.x/en-us/task-bar-94411C9.html) describes equivalent UI actions, but no QuTS hero firmware or live device was inspected for this CGI contract. QuTS hero API compatibility remains unverified.
 
 ## Safe validation on the TS-431P

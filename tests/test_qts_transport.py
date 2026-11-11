@@ -18,6 +18,7 @@ from qnap_client import (
     QnapConnectionError,
     QnapPermissionError,
     QnapTimeoutError,
+    QnapTwoStepRequiredError,
 )
 
 SID = "synthetic-secret-sid"
@@ -90,6 +91,24 @@ async def test_failed_login_clears_old_sid_and_sanitizes_malformed_xml(server):
             await client.login()
         assert client._sid is None
         assert_no_secrets(caught.value)
+    finally:
+        await client.close(logout=False)
+
+
+@pytest.mark.parametrize("marker", ["need_2sv", "need_2_step_verification"])
+async def test_two_step_challenge_has_specific_safe_error(server, marker):
+    port, state = server
+    state["login_body"] = (
+        f"<QDocRoot><authPassed>0</authPassed><{marker}>1</{marker}>"
+        f"<authSid>{SID}</authSid></QDocRoot>"
+    )
+    client = QnapClient("127.0.0.1", port, "user", PASSWORD)
+    try:
+        with pytest.raises(QnapTwoStepRequiredError) as caught:
+            await client.login()
+        assert client._sid is None
+        assert_no_secrets(caught.value)
+        assert [method for method, _, _ in state["calls"]] == ["POST"]
     finally:
         await client.close(logout=False)
 
