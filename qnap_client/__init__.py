@@ -9,7 +9,11 @@ from .exceptions import (
     QnapAuthError,
     QnapConnectionError,
     QnapError,
+    QnapPermissionError,
+    QnapPowerOutcomeUnknown,
+    QnapPowerRejectedError,
     QnapTimeoutError,
+    QnapTwoStepRequiredError,
 )
 from .models import (
     Container,
@@ -33,6 +37,10 @@ __all__ = [
     "ContainerStationClient",
     # Exceptions
     "QnapError",
+    "QnapPermissionError",
+    "QnapPowerOutcomeUnknown",
+    "QnapPowerRejectedError",
+    "QnapTwoStepRequiredError",
     "QnapAuthError",
     "QnapConnectionError",
     "QnapTimeoutError",
