@@ -92,6 +92,35 @@ The actual NAS trial preceded this correction and used the earlier runner
 identified in the preserved-source table below. These are separate versions
 with separate validation records.
 
+## Offline consolidation after trial closure
+
+Further offline review found that cancellation during local client cleanup or
+failure while closing the runner's HTTP session could prevent an already
+recorded API result from reaching the final report. The existing runner now
+preserves that result, retains the first local error and keeps cancellation
+status independent of the operation outcome. Main reports the local failure
+through `executor_result` and `executor_error` while preserving acceptance,
+rejection or uncertainty from the API.
+
+The previous KeyError-fixed runner and tests remain in the private archive
+`source-runner-keyerror-fix.zip`, SHA256
+`9ba37bce1658e8f5fbb9898efa77060ec954b40e2773fbc3ba5ca38fbbde102a`.
+The consolidated runner SHA256 is
+`cb8883ae4da1f2d7a64ef85ebb1af2569da4ad25bd3f96a4e6d18887ea2366b3`,
+and its tests SHA256 is
+`fde663c206a938adff7775446caed4813368379a37bf28ce9aba05174fcd6871`.
+They are preserved privately in `source-runner-consolidated.zip`, SHA256
+`5a6698d7b5b4575d186da529d844f50b325b9952226a11b3f1400687100322c2`.
+The adjacent manifest identifies both offline revisions separately from the
+earlier hardware trial snapshot.
+
+The cleanup regression fails against the earlier offline runner and passes
+after consolidation. All 120 Python diagnostic tests passed, including 45
+runner tests. Both offline runner revisions postdate the real reboot trial.
+The request guard, public power-method adapter, TLS selection and existing
+authentication calls retain their behavior. These executors remain outside
+the package and proposed PR.
+
 ## Preserved source and comparison status
 
 The local source was captured after the owner's report and before the runner

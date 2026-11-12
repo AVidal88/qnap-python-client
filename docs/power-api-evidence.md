@@ -223,12 +223,14 @@ pytest-asyncio 1.5.0 and aioresponses 0.7.9. All 99 library tests passed and
 `pip check` found consistent requirements. The development extra constrains
 aiohttp below 3.14 for the existing aioresponses-based suite. Separately, all
 93 power/transport tests passed with isolated aiohttp 3.14.5 using loopback
-servers. Runtime dependency bounds retain their upstream values.
+servers. Those 93 cases are a subset of the 99 library tests, repeated for
+runtime compatibility. Runtime dependency bounds retain their upstream values.
 
-The 116 local diagnostic tests also passed against the candidate. Those tests
-and their interactive adapter remain separate test infrastructure outside this
-PR. The 90-test library results recorded in the earlier trial notes describe
-the source state before the final regression additions.
+The consolidated local diagnostic suite passed 120 tests, including 45 runner
+tests. Those tests and their interactive adapter remain separate infrastructure
+outside this PR. The earlier 116 diagnostic and 90 library results retain their
+historical source state in the trial notes. These suite and subset counts are
+reported independently.
 
 The wheel built locally with the inherited package metadata contains the five
 package modules, distribution metadata and license. Source bytes were checked
@@ -241,4 +243,6 @@ Focused Ruff checks pass for the added tests and exception definitions. The
 expanded library check retains three upstream findings, two B023 monitoring
 closures and RUF022 for the grouped exports. Pytest emits the inherited
 unset-async-fixture-scope deprecation warning. The existing CI matrix covers
-Python 3.12 and 3.13. Current local execution covers Python 3.12.10.
+Python 3.12 and 3.13. Current local execution covers Python 3.12.10. Python 3.13
+was unavailable locally, so its suite and dependency resolution remain for CI
+when the PR is opened.
