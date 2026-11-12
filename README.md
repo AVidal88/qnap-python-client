@@ -61,6 +61,7 @@ QnapClient(
 |---|---|---|
 | `login()` | `None` | Authenticate and store session ID |
 | `logout()` | `None` | Log out and clear session |
+| `close(logout=True)` | `None` | Release an owned HTTP session, optionally without a logout request |
 | `get_system_info()` | `SystemInfo` | CPU, memory, firmware version, uptime |
 | `get_system_health()` | `SystemHealth` | Overall health status string |
 | `get_network_interfaces()` | `list[NetworkInterface]` | Per-interface RX/TX rates |
@@ -70,6 +71,8 @@ QnapClient(
 | `get_fans()` | `list[FanStatus]` | Fan speed RPM (empty list if unsupported) |
 | `get_external_drives()` | `list[ExternalDrive]` | External USB/eSATA drives |
 | `get_all()` | `NasData` | All of the above in parallel |
+| `shutdown()` | `None` | Request safe QTS shutdown, returning after CGI acknowledgement |
+| `reboot()` | `None` | Request safe QTS restart, returning after CGI acknowledgement |
 
 ### `ContainerStationClient`
 
@@ -111,9 +114,72 @@ async with QnapClient(...) as client:
 |---|---|
 | `QnapError` | Base exception |
 | `QnapAuthError` | Bad credentials or session expired |
+| `QnapTwoStepRequiredError` | QTS requests a second login factor unsupported by this password-only client |
+| `QnapPermissionError` | Request forbidden by HTTP 403 |
 | `QnapConnectionError` | NAS unreachable |
 | `QnapTimeoutError` | Request timed out |
 | `QnapAPIError` | Unexpected or malformed API response |
+| `QnapPowerOutcomeUnknown` | A power request may have executed |
+| `QnapPowerRejectedError` | QTS reports a negative setting result or ambiguous session/permission rejection |
+
+## Shutdown and reboot
+
+The power methods follow the single authenticated POST used by the TS-431P
+QTS 5.2.11.3661 web client. `shutdown()` uses `apply=shutdown` and `reboot()`
+uses `apply=restart` with `subfunc=power_mgmt` at
+`/cgi-bin/sys/sysRequest.cgi`.
+
+```python
+from qnap_client import QnapClient
+
+async def request_shutdown(host, port, username, password, *, verify_ssl=True):
+    async with QnapClient(
+        host, port, username, password, ssl=True, verify_ssl=verify_ssl
+    ) as client:
+        await client.shutdown()
+```
+
+Use `await client.reboot()` to request a restart. Each power request respects
+the existing `ssl` and `verify_ssl` constructor options.
+An owned HTTP session verifies certificates by default. A supplied session
+retains its connector's TLS context, including any custom CA policy, while
+`verify_ssl=False` explicitly disables verification for these requests.
+
+The classifier recognizes unique direct `authPassed=1` and `setting_result=0`
+under `QDocRoot` as nominal CGI acceptance. This contract comes from static
+inspection of the official QTS 5.2.11.3661 backend. Returning `None` acknowledges
+the request independently of physical completion. HTTP 200 or `authPassed=1`
+alone leaves acceptance unknown.
+
+Negative CGI results raise `QnapPowerRejectedError`. Its safe `reason` separates
+`setting_failed` from `authentication_or_permission`, whose causes share one
+server response. Unexpected responses, server errors and connection loss raise
+`QnapPowerOutcomeUnknown` with a safe `reason` and available `http_status`.
+Observe the device after an uncertain outcome. Each method sends one POST and
+clears its local SID afterward so closing the client sends no logout request
+while QTS may be going offline. Cancellation propagates with the same outcome
+uncertainty.
+
+Further API calls require authentication again. The public `login()` performs
+password authentication and raises `QnapTwoStepRequiredError` when QTS requests
+another factor. The interactive password/TOTP adapter used for the hardware
+trials belongs to separate test infrastructure. General MFA, persistent
+credentials and session renewal remain separate contributions. The public power
+methods use the session established by the library's existing login flow.
+
+The UI's optional warning checks are separate from the final QTS action. Missing
+preflight items do not establish inactive services. See the
+[firmware and device evidence](docs/power-api-evidence.md).
+
+Tests use loopback servers and explicitly reconstructed responses. The owner
+validated one physical shutdown and subsequent WOL power-on on a TS-431P with
+QTS 5.2.11.3661. Its full response was unavailable. One subsequent reboot
+returned the recognized CGI acknowledgement and was followed by a remotely
+observed interval of unavailability and restored access. Its duration was
+unmeasured. Post-reboot uptime and physical inspection were unrecorded. The
+owner considered the trials satisfactory and closed this validation round.
+Evidence is limited to that model and firmware. Minimum permissions, other
+models and QuTS hero remain unverified.
 
 ## HTTPS / Self-Signed Certificates
 
